@@ -1,8 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
-import { env } from "@/lib/env";
+import { resolveConfigPathCandidates, resolveStateDir } from "@/lib/clawdbot/paths";
 
 type ClawdbotConfig = Record<string, unknown>;
 
@@ -12,44 +11,7 @@ type AgentEntry = {
   workspace?: string;
 };
 
-const LEGACY_STATE_DIRNAME = ".clawdbot";
-const NEW_STATE_DIRNAME = ".moltbot";
 const CONFIG_FILENAME = "moltbot.json";
-
-const resolveUserPath = (input: string) => {
-  const trimmed = input.trim();
-  if (!trimmed) return trimmed;
-  if (trimmed.startsWith("~")) {
-    const expanded = trimmed.replace(/^~(?=$|[\\/])/, os.homedir());
-    return path.resolve(expanded);
-  }
-  return path.resolve(trimmed);
-};
-
-const resolveStateDir = () => {
-  const raw = env.MOLTBOT_STATE_DIR ?? env.CLAWDBOT_STATE_DIR;
-  if (raw?.trim()) {
-    return resolveUserPath(raw);
-  }
-  return path.join(os.homedir(), LEGACY_STATE_DIRNAME);
-};
-
-const resolveConfigPathCandidates = () => {
-  const explicit = env.MOLTBOT_CONFIG_PATH ?? env.CLAWDBOT_CONFIG_PATH;
-  if (explicit?.trim()) {
-    return [resolveUserPath(explicit)];
-  }
-  const candidates: string[] = [];
-  if (env.MOLTBOT_STATE_DIR?.trim()) {
-    candidates.push(path.join(resolveUserPath(env.MOLTBOT_STATE_DIR), CONFIG_FILENAME));
-  }
-  if (env.CLAWDBOT_STATE_DIR?.trim()) {
-    candidates.push(path.join(resolveUserPath(env.CLAWDBOT_STATE_DIR), CONFIG_FILENAME));
-  }
-  candidates.push(path.join(os.homedir(), NEW_STATE_DIRNAME, CONFIG_FILENAME));
-  candidates.push(path.join(os.homedir(), LEGACY_STATE_DIRNAME, CONFIG_FILENAME));
-  return candidates;
-};
 
 const parseJsonLoose = (raw: string) => {
   try {

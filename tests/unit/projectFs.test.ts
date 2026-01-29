@@ -4,11 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import {
-  deleteDirIfExists,
-  resolveClawdbotStateDir,
-  resolveHomePath,
-} from "@/lib/projects/fs.server";
+import { deleteDirIfExists } from "@/lib/projects/fs.server";
+import { resolveStateDir, resolveUserPath } from "@/lib/clawdbot/paths";
 
 let tempDir: string | null = null;
 
@@ -21,24 +18,26 @@ const cleanup = () => {
 afterEach(cleanup);
 
 describe("projectFs", () => {
-  it("resolvesHomePathVariants", () => {
-    expect(resolveHomePath("~")).toBe(os.homedir());
-    expect(resolveHomePath("~/foo")).toBe(path.join(os.homedir(), "foo"));
-    expect(resolveHomePath("/tmp/x")).toBe("/tmp/x");
+  it("resolvesUserPathVariants", () => {
+    const home = path.join(os.tmpdir(), "clawdbot-test-home");
+    expect(resolveUserPath("~", () => home)).toBe(home);
+    expect(resolveUserPath("~/foo", () => home)).toBe(path.join(home, "foo"));
+    expect(resolveUserPath("/tmp/x", () => home)).toBe("/tmp/x");
   });
 
-  it("resolvesClawdbotStateDirFromEnv", () => {
-    const prev = process.env.CLAWDBOT_STATE_DIR;
-    process.env.CLAWDBOT_STATE_DIR = "~/state-test";
-    try {
-      expect(resolveClawdbotStateDir()).toBe(path.join(os.homedir(), "state-test"));
-    } finally {
-      if (prev === undefined) {
-        delete process.env.CLAWDBOT_STATE_DIR;
-      } else {
-        process.env.CLAWDBOT_STATE_DIR = prev;
-      }
-    }
+  it("resolvesStateDirFromEnv", () => {
+    const home = path.join(os.tmpdir(), "clawdbot-test-home");
+    const env = { CLAWDBOT_STATE_DIR: "~/state-test" } as unknown as NodeJS.ProcessEnv;
+    expect(resolveStateDir(env, () => home)).toBe(path.join(home, "state-test"));
+  });
+
+  it("prefersMoltbotWhenLegacyMissing", () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawdbot-projectfs-"));
+    const home = tempDir;
+    const moltbotDir = path.join(home, ".moltbot");
+    fs.mkdirSync(moltbotDir, { recursive: true });
+    const env = {} as unknown as NodeJS.ProcessEnv;
+    expect(resolveStateDir(env, () => home)).toBe(moltbotDir);
   });
 
   it("deleteDirIfExistsRemovesDirectory", () => {
