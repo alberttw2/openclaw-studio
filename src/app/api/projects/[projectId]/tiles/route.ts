@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { logger } from "@/lib/logger";
@@ -14,82 +13,23 @@ import type {
   ProjectsStore,
 } from "@/lib/projects/types";
 import { resolveAgentWorkspaceDir } from "@/lib/projects/agentWorkspace";
+import { resolveClawdbotStateDir } from "@/lib/projects/fs.server";
 import {
   loadClawdbotConfig,
   saveClawdbotConfig,
   upsertAgentEntry,
 } from "@/lib/clawdbot/config";
 import { generateAgentId } from "@/lib/ids/agentId";
+import { provisionWorkspaceFiles } from "@/lib/projects/workspaceFiles.server";
 import { loadStore, saveStore } from "../../store";
 
 export const runtime = "nodejs";
 
 const ROLE_VALUES: ProjectTileRole[] = ["coding", "research", "marketing"];
 
-const resolveHomePath = (inputPath: string) => {
-  if (inputPath === "~") {
-    return os.homedir();
-  }
-  if (inputPath.startsWith("~/")) {
-    return path.join(os.homedir(), inputPath.slice(2));
-  }
-  return inputPath;
-};
-
-const ensureDir = (dir: string) => {
-  if (fs.existsSync(dir)) {
-    const stat = fs.statSync(dir);
-    if (!stat.isDirectory()) {
-      throw new Error(`${dir} exists and is not a directory.`);
-    }
-    return;
-  }
-  fs.mkdirSync(dir, { recursive: true });
-};
-
-const ensureFile = (filePath: string, contents: string) => {
-  if (fs.existsSync(filePath)) {
-    return;
-  }
-  fs.writeFileSync(filePath, contents, "utf8");
-};
-
-const deleteFileIfExists = (filePath: string) => {
-  if (!fs.existsSync(filePath)) {
-    return;
-  }
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile()) {
-    return;
-  }
-  fs.rmSync(filePath);
-};
-
-const provisionWorkspace = ({
-  workspaceDir,
-}: {
-  workspaceDir: string;
-}): string[] => {
-  const warnings: string[] = [];
-  ensureDir(workspaceDir);
-
-  deleteFileIfExists(path.join(workspaceDir, "BOOTSTRAP.md"));
-  ensureFile(path.join(workspaceDir, "AGENTS.md"), "");
-  ensureFile(path.join(workspaceDir, "SOUL.md"), "");
-  ensureFile(path.join(workspaceDir, "IDENTITY.md"), "");
-  ensureFile(path.join(workspaceDir, "USER.md"), "");
-  ensureFile(path.join(workspaceDir, "HEARTBEAT.md"), "");
-  ensureFile(path.join(workspaceDir, "TOOLS.md"), "");
-  ensureFile(path.join(workspaceDir, "MEMORY.md"), "");
-  ensureDir(path.join(workspaceDir, "memory"));
-
-  return warnings;
-};
-
 const copyAuthProfiles = (agentId: string): string[] => {
   const warnings: string[] = [];
-  const stateDirRaw = process.env.CLAWDBOT_STATE_DIR ?? "~/.clawdbot";
-  const stateDir = resolveHomePath(stateDirRaw);
+  const stateDir = resolveClawdbotStateDir();
   const sourceAgentId = process.env.CLAWDBOT_DEFAULT_AGENT_ID ?? "main";
   const source = path.join(stateDir, "agents", sourceAgentId, "agent", "auth-profiles.json");
   const destination = path.join(stateDir, "agents", agentId, "agent", "auth-profiles.json");
@@ -101,7 +41,7 @@ const copyAuthProfiles = (agentId: string): string[] => {
     warnings.push(`No auth profiles found at ${source}; agent may need login.`);
     return warnings;
   }
-  ensureDir(path.dirname(destination));
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.copyFileSync(source, destination);
   return warnings;
 };
@@ -187,10 +127,8 @@ export async function POST(
     const nextStore = updateStoreProject(store, trimmedProjectId, tile);
     saveStore(nextStore);
 
-    const warnings = [
-      ...provisionWorkspace({ workspaceDir }),
-      ...copyAuthProfiles(agentId),
-    ];
+    const { warnings: workspaceWarnings } = provisionWorkspaceFiles(workspaceDir);
+    const warnings = [...workspaceWarnings, ...copyAuthProfiles(agentId)];
     try {
       const { config, configPath } = loadClawdbotConfig();
       const changed = upsertAgentEntry(config, {

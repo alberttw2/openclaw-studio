@@ -1,12 +1,8 @@
 import { NextResponse } from "next/server";
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
 import { logger } from "@/lib/logger";
 import type { ProjectTileUpdatePayload } from "@/lib/projects/types";
-import { resolveAgentWorkspaceDir } from "@/lib/projects/agentWorkspace";
+import { deleteAgentArtifacts } from "@/lib/projects/fs.server";
 import {
   loadClawdbotConfig,
   removeAgentEntry,
@@ -165,35 +161,3 @@ export async function PATCH(
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
-
-const resolveHomePath = (inputPath: string) => {
-  if (inputPath === "~") {
-    return os.homedir();
-  }
-  if (inputPath.startsWith("~/")) {
-    return path.join(os.homedir(), inputPath.slice(2));
-  }
-  return inputPath;
-};
-
-const deleteDirIfExists = (targetPath: string, label: string, warnings: string[]) => {
-  if (!fs.existsSync(targetPath)) {
-    warnings.push(`${label} not found at ${targetPath}.`);
-    return;
-  }
-  const stat = fs.statSync(targetPath);
-  if (!stat.isDirectory()) {
-    throw new Error(`${label} path is not a directory: ${targetPath}`);
-  }
-  fs.rmSync(targetPath, { recursive: true, force: false });
-};
-
-const deleteAgentArtifacts = (projectId: string, agentId: string, warnings: string[]) => {
-  const workspaceDir = resolveAgentWorkspaceDir(projectId, agentId);
-  deleteDirIfExists(workspaceDir, "Agent workspace", warnings);
-
-  const stateDirRaw = process.env.CLAWDBOT_STATE_DIR ?? "~/.clawdbot";
-  const stateDir = resolveHomePath(stateDirRaw);
-  const agentDir = path.join(stateDir, "agents", agentId);
-  deleteDirIfExists(agentDir, "Agent state", warnings);
-};

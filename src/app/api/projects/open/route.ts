@@ -2,10 +2,10 @@ import { NextResponse } from "next/server";
 
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { logger } from "@/lib/logger";
+import { resolveHomePath } from "@/lib/projects/fs.server";
 import type {
   Project,
   ProjectOpenPayload,
@@ -28,16 +28,6 @@ const normalizeProjectsStore = (store: ProjectsStore): ProjectsStore => {
     activeProjectId,
     projects,
   };
-};
-
-const resolveHomePath = (inputPath: string) => {
-  if (inputPath === "~") {
-    return os.homedir();
-  }
-  if (inputPath.startsWith("~/")) {
-    return path.join(os.homedir(), inputPath.slice(2));
-  }
-  return inputPath;
 };
 
 export async function POST(request: Request) {
