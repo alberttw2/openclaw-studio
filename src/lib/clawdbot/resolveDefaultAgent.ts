@@ -1,52 +1,18 @@
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
-import { resolveUserPath } from "@/lib/clawdbot/paths";
-
-type AgentEntry = Record<string, unknown> & {
-  id?: string;
-  default?: boolean;
-  workspace?: string;
-};
+import { readAgentList } from "@/lib/clawdbot/config";
+import { resolveStateDir, resolveUserPath } from "@/lib/clawdbot/paths";
 
 const DEFAULT_AGENT_ID = "main";
 
-const resolveDefaultWorkspaceRoot = (
-  env: NodeJS.ProcessEnv = process.env,
-  homedir: () => string = os.homedir
-) => {
-  const override =
-    env.OPENCLAW_STATE_DIR?.trim() ||
-    env.MOLTBOT_STATE_DIR?.trim() ||
-    env.CLAWDBOT_STATE_DIR?.trim();
-  if (override) {
-    return resolveUserPath(override, homedir);
-  }
-  const home = homedir();
-  const clawdbotDir = path.join(home, ".clawdbot");
-  const moltbotDir = path.join(home, ".moltbot");
-  const openclawDir = path.join(home, ".openclaw");
-  if (fs.existsSync(clawdbotDir)) return clawdbotDir;
-  if (fs.existsSync(moltbotDir)) return moltbotDir;
-  if (fs.existsSync(openclawDir)) return openclawDir;
-  return clawdbotDir;
-};
-
 const resolveDefaultWorkspaceDir = (
   env: NodeJS.ProcessEnv = process.env,
-  homedir: () => string = os.homedir
+  homedir?: () => string
 ) => {
   const profile = env.OPENCLAW_PROFILE?.trim();
   const suffix =
     profile && profile.toLowerCase() !== "default" ? `workspace-${profile}` : "workspace";
-  return path.join(resolveDefaultWorkspaceRoot(env, homedir), suffix);
-};
-
-const readAgentList = (config: Record<string, unknown>): AgentEntry[] => {
-  const agents = (config.agents ?? {}) as Record<string, unknown>;
-  const list = Array.isArray(agents.list) ? agents.list : [];
-  return list.filter((entry): entry is AgentEntry => Boolean(entry && typeof entry === "object"));
+  return path.join(resolveStateDir(env, homedir), suffix);
 };
 
 export const resolveDefaultAgentId = (config: Record<string, unknown>): string => {
