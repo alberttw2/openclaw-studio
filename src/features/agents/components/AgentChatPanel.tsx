@@ -3,7 +3,7 @@ import type { AgentState as AgentRecord } from "@/features/agents/state/store";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { normalizeAgentName } from "@/lib/names/agentNames";
-import { Shuffle } from "lucide-react";
+import { Cog, Shuffle } from "lucide-react";
 import { AgentAvatar } from "./AgentAvatar";
 import { buildAgentChatItems, summarizeToolLabel } from "./chatItems";
 import { EmptyStatePanel } from "./EmptyStatePanel";
@@ -12,7 +12,7 @@ type AgentChatPanelProps = {
   agent: AgentRecord;
   isSelected: boolean;
   canSend: boolean;
-  onInspect: () => void;
+  onOpenSettings: () => void;
   onNameChange: (name: string) => Promise<boolean>;
   onDraftChange: (value: string) => void;
   onSend: (message: string) => void;
@@ -23,7 +23,7 @@ export const AgentChatPanel = ({
   agent,
   isSelected,
   canSend,
-  onInspect,
+  onOpenSettings,
   onNameChange,
   onDraftChange,
   onSend,
@@ -170,12 +170,14 @@ export const AgentChatPanel = ({
                   {statusLabel}
                 </span>
                 <button
-                  className="nodrag rounded-md border border-border/80 bg-card/60 px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.13em] text-muted-foreground transition hover:border-border hover:bg-muted/65"
+                  className="nodrag flex h-9 w-9 items-center justify-center rounded-md border border-border/80 bg-card/60 text-muted-foreground transition hover:border-border hover:bg-muted/65"
                   type="button"
-                  data-testid="agent-inspect-toggle"
-                  onClick={onInspect}
+                  data-testid="agent-settings-toggle"
+                  aria-label="Open agent settings"
+                  title="Agent settings"
+                  onClick={onOpenSettings}
                 >
-                  Inspect
+                  <Cog className="h-4 w-4" />
                 </button>
               </div>
             </div>

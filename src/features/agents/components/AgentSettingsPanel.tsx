@@ -1,6 +1,5 @@
 "use client";
 
-import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { AgentState } from "@/features/agents/state/store";
 import type { GatewayClient } from "@/lib/gateway/GatewayClient";
@@ -9,20 +8,11 @@ import {
   updateGatewayHeartbeat,
   type GatewayConfigSnapshot,
 } from "@/lib/gateway/agentConfig";
-import { invokeGatewayTool } from "@/lib/gateway/tools";
 import type { GatewayModelChoice } from "@/lib/gateway/models";
-import {
-  createAgentFilesState,
-  isAgentFileName,
-  AGENT_FILE_META,
-  AGENT_FILE_NAMES,
-  AGENT_FILE_PLACEHOLDERS,
-  type AgentFileName,
-} from "@/lib/agents/agentFiles";
 
 const HEARTBEAT_INTERVAL_OPTIONS = ["15m", "30m", "1h", "2h", "6h", "12h", "24h"];
 
-type AgentInspectPanelProps = {
+type AgentSettingsPanelProps = {
   agent: AgentState;
   client: GatewayClient;
   models: GatewayModelChoice[];
@@ -34,7 +24,7 @@ type AgentInspectPanelProps = {
   onThinkingTracesToggle: (enabled: boolean) => void;
 };
 
-export const AgentInspectPanel = ({
+export const AgentSettingsPanel = ({
   agent,
   client,
   models,
@@ -44,15 +34,7 @@ export const AgentInspectPanel = ({
   onThinkingChange,
   onToolCallingToggle,
   onThinkingTracesToggle,
-}: AgentInspectPanelProps) => {
-  const [agentFiles, setAgentFiles] = useState(createAgentFilesState);
-  const [agentFileTab, setAgentFileTab] = useState<AgentFileName>(
-    AGENT_FILE_NAMES[0]
-  );
-  const [agentFilesLoading, setAgentFilesLoading] = useState(false);
-  const [agentFilesSaving, setAgentFilesSaving] = useState(false);
-  const [agentFilesDirty, setAgentFilesDirty] = useState(false);
-  const [agentFilesError, setAgentFilesError] = useState<string | null>(null);
+}: AgentSettingsPanelProps) => {
   const [heartbeatLoading, setHeartbeatLoading] = useState(false);
   const [heartbeatSaving, setHeartbeatSaving] = useState(false);
   const [heartbeatDirty, setHeartbeatDirty] = useState(false);
@@ -60,137 +42,19 @@ export const AgentInspectPanel = ({
   const [heartbeatOverride, setHeartbeatOverride] = useState(false);
   const [heartbeatEnabled, setHeartbeatEnabled] = useState(true);
   const [heartbeatEvery, setHeartbeatEvery] = useState("30m");
-  const [heartbeatIntervalMode, setHeartbeatIntervalMode] = useState<
-    "preset" | "custom"
-  >("preset");
+  const [heartbeatIntervalMode, setHeartbeatIntervalMode] = useState<"preset" | "custom">(
+    "preset"
+  );
   const [heartbeatCustomMinutes, setHeartbeatCustomMinutes] = useState("45");
-  const [heartbeatTargetMode, setHeartbeatTargetMode] = useState<
-    "last" | "none" | "custom"
-  >("last");
+  const [heartbeatTargetMode, setHeartbeatTargetMode] = useState<"last" | "none" | "custom">(
+    "last"
+  );
   const [heartbeatTargetCustom, setHeartbeatTargetCustom] = useState("");
   const [heartbeatIncludeReasoning, setHeartbeatIncludeReasoning] = useState(false);
-  const [heartbeatActiveHoursEnabled, setHeartbeatActiveHoursEnabled] =
-    useState(false);
+  const [heartbeatActiveHoursEnabled, setHeartbeatActiveHoursEnabled] = useState(false);
   const [heartbeatActiveStart, setHeartbeatActiveStart] = useState("08:00");
   const [heartbeatActiveEnd, setHeartbeatActiveEnd] = useState("18:00");
   const [heartbeatAckMaxChars, setHeartbeatAckMaxChars] = useState("300");
-  const extractToolText = useCallback((result: unknown) => {
-    if (!result || typeof result !== "object") return "";
-    const record = result as Record<string, unknown>;
-    if (typeof record.text === "string") return record.text;
-    const content = record.content;
-    if (!Array.isArray(content)) return "";
-    const blocks = content
-      .map((item) => {
-        if (!item || typeof item !== "object") return null;
-        const block = item as Record<string, unknown>;
-        if (block.type !== "text" || typeof block.text !== "string") return null;
-        return block.text;
-      })
-      .filter((text): text is string => Boolean(text));
-    return blocks.join("");
-  }, []);
-
-  const isMissingFileError = useCallback(
-    (message: string) => /no such file|enoent/i.test(message),
-    []
-  );
-
-  const loadAgentFiles = useCallback(async () => {
-    setAgentFilesLoading(true);
-    setAgentFilesError(null);
-    try {
-      const sessionKey = agent.sessionKey?.trim();
-      if (!sessionKey) {
-        setAgentFilesError("Session key is missing for this agent.");
-        return;
-      }
-      const results = await Promise.all(
-        AGENT_FILE_NAMES.map(async (name) => {
-          const response = await invokeGatewayTool({
-            tool: "read",
-            sessionKey,
-            args: { path: name },
-          });
-          if (!response.ok) {
-            if (isMissingFileError(response.error)) {
-              return { name, content: "", exists: false };
-            }
-            throw new Error(response.error);
-          }
-          const content = extractToolText(response.result);
-          return { name, content, exists: true };
-        })
-      );
-      const nextState = createAgentFilesState();
-      for (const file of results) {
-        if (!isAgentFileName(file.name)) continue;
-        nextState[file.name] = {
-          content: file.content ?? "",
-          exists: Boolean(file.exists),
-        };
-      }
-      setAgentFiles(nextState);
-      setAgentFilesDirty(false);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to load agent files.";
-      setAgentFilesError(message);
-    } finally {
-      setAgentFilesLoading(false);
-    }
-  }, [extractToolText, isMissingFileError, agent.sessionKey]);
-
-  const saveAgentFiles = useCallback(async () => {
-    setAgentFilesSaving(true);
-    setAgentFilesError(null);
-    try {
-      const sessionKey = agent.sessionKey?.trim();
-      if (!sessionKey) {
-        setAgentFilesError("Session key is missing for this agent.");
-        return;
-      }
-      await Promise.all(
-        AGENT_FILE_NAMES.map(async (name) => {
-          const response = await invokeGatewayTool({
-            tool: "write",
-            sessionKey,
-            args: { path: name, content: agentFiles[name].content },
-          });
-          if (!response.ok) {
-            throw new Error(response.error);
-          }
-          return name;
-        })
-      );
-      const nextState = createAgentFilesState();
-      for (const name of AGENT_FILE_NAMES) {
-        nextState[name] = {
-          content: agentFiles[name].content,
-          exists: true,
-        };
-      }
-      setAgentFiles(nextState);
-      setAgentFilesDirty(false);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to save agent files.";
-      setAgentFilesError(message);
-    } finally {
-      setAgentFilesSaving(false);
-    }
-  }, [agent.sessionKey, agentFiles]);
-
-  const handleAgentFileTabChange = useCallback(
-    (nextTab: AgentFileName) => {
-      if (nextTab === agentFileTab) return;
-      if (agentFilesDirty && !agentFilesSaving) {
-        void saveAgentFiles();
-      }
-      setAgentFileTab(nextTab);
-    },
-    [saveAgentFiles, agentFilesDirty, agentFilesSaving, agentFileTab]
-  );
 
   const loadHeartbeat = useCallback(async () => {
     setHeartbeatLoading(true);
@@ -252,9 +116,7 @@ export const AgentInspectPanel = ({
     setHeartbeatError(null);
     try {
       const target =
-        heartbeatTargetMode === "custom"
-          ? heartbeatTargetCustom.trim()
-          : heartbeatTargetMode;
+        heartbeatTargetMode === "custom" ? heartbeatTargetCustom.trim() : heartbeatTargetMode;
       let every = heartbeatEnabled ? heartbeatEvery.trim() : "0m";
       if (heartbeatEnabled && heartbeatIntervalMode === "custom") {
         const customValue = Number.parseInt(heartbeatCustomMinutes, 10);
@@ -339,15 +201,8 @@ export const AgentInspectPanel = ({
   ]);
 
   useEffect(() => {
-    void loadAgentFiles();
     void loadHeartbeat();
-  }, [loadAgentFiles, loadHeartbeat]);
-
-  useEffect(() => {
-    if (!AGENT_FILE_NAMES.includes(agentFileTab)) {
-      setAgentFileTab(AGENT_FILE_NAMES[0]);
-    }
-  }, [agentFileTab]);
+  }, [loadHeartbeat]);
 
   const modelOptions = useMemo(
     () =>
@@ -366,28 +221,26 @@ export const AgentInspectPanel = ({
     modelValue && !modelOptions.some((option) => option.value === modelValue)
       ? [{ value: modelValue, label: modelValue, reasoning: undefined }, ...modelOptions]
       : modelOptions;
-  const selectedModel = modelOptionsWithFallback.find(
-    (option) => option.value === modelValue
-  );
+  const selectedModel = modelOptionsWithFallback.find((option) => option.value === modelValue);
   const allowThinking = selectedModel?.reasoning !== false;
 
   return (
     <div
       className="agent-inspect-panel"
-      data-testid="agent-inspect-panel"
+      data-testid="agent-settings-panel"
       style={{ position: "relative", left: "auto", top: "auto", width: "100%", height: "100%" }}
     >
       <div className="flex items-center justify-between border-b border-border/80 px-4 py-3">
         <div>
           <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-            Inspect
+            Agent settings
           </div>
           <div className="console-title text-2xl leading-none text-foreground">{agent.name}</div>
         </div>
         <button
           className="rounded-md border border-border/80 bg-card/70 px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground transition hover:border-border hover:bg-muted/65"
           type="button"
-          data-testid="agent-inspect-close"
+          data-testid="agent-settings-close"
           onClick={onClose}
         >
           Close
@@ -396,95 +249,11 @@ export const AgentInspectPanel = ({
 
       <div className="flex flex-col gap-4 p-4">
         <section
-          className="flex min-h-[420px] flex-1 flex-col rounded-md border border-border/80 bg-card/70 p-4"
-          data-testid="agent-inspect-files"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-              Brain files
-            </div>
-            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-              {agentFilesLoading
-                ? "Loading..."
-                : agentFilesDirty
-                  ? "Saving on tab change"
-                  : "All changes saved"}
-            </div>
-          </div>
-          {agentFilesError ? (
-            <div className="mt-3 rounded-md border border-destructive bg-destructive px-3 py-2 text-xs text-destructive-foreground">
-              {agentFilesError}
-            </div>
-          ) : null}
-          <div className="mt-4 flex flex-wrap items-end gap-2">
-            {AGENT_FILE_NAMES.map((name) => {
-              const active = name === agentFileTab;
-              const label = AGENT_FILE_META[name].title.replace(".md", "");
-              return (
-                <button
-                  key={name}
-                  type="button"
-                  className={`rounded-full border px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
-                    active
-                      ? "border-border bg-background text-foreground shadow-sm"
-                      : "border-transparent bg-muted/60 text-muted-foreground hover:border-border/80 hover:bg-muted"
-                  }`}
-                  onClick={() => handleAgentFileTabChange(name)}
-                >
-                  {label}
-                </button>
-              );
-            })}
-          </div>
-          <div className="mt-3 flex-1 overflow-auto rounded-md border border-border/70 bg-muted/40 p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <div className="text-sm font-semibold uppercase tracking-[0.05em] text-foreground">
-                  {AGENT_FILE_META[agentFileTab].title}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {AGENT_FILE_META[agentFileTab].hint}
-                </div>
-              </div>
-              {!agentFiles[agentFileTab].exists ? (
-                <span className="rounded-md border border-border bg-muted px-2 py-1 font-mono text-[9px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                  new
-                </span>
-              ) : null}
-            </div>
-
-            <textarea
-              className="mt-4 min-h-[220px] w-full resize-none rounded-md border border-border bg-background/75 px-3 py-2 font-mono text-xs text-foreground outline-none"
-              value={agentFiles[agentFileTab].content}
-              placeholder={
-                agentFiles[agentFileTab].content.trim().length === 0
-                  ? AGENT_FILE_PLACEHOLDERS[agentFileTab]
-                  : undefined
-              }
-              disabled={agentFilesLoading || agentFilesSaving}
-              onChange={(event) => {
-                const value = event.target.value;
-                setAgentFiles((prev) => ({
-                  ...prev,
-                  [agentFileTab]: { ...prev[agentFileTab], content: value },
-                }));
-                setAgentFilesDirty(true);
-              }}
-            />
-          </div>
-          <div className="mt-4 flex items-center justify-between gap-2 border-t border-border pt-4">
-            <div className="text-xs text-muted-foreground">
-              {agentFilesDirty ? "Auto-save on tab switch." : "Up to date."}
-            </div>
-          </div>
-        </section>
-
-        <section
           className="rounded-md border border-border/80 bg-card/70 p-4"
-          data-testid="agent-inspect-settings"
+          data-testid="agent-settings-runtime"
         >
           <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-            Settings
+            Runtime settings
           </div>
           <div className="mt-3 grid gap-3 md:grid-cols-[1.2fr_1fr]">
             <label className="flex min-w-0 flex-col gap-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
@@ -497,9 +266,7 @@ export const AgentInspectPanel = ({
                   onModelChange(value ? value : null);
                 }}
               >
-                {modelOptionsWithFallback.length === 0 ? (
-                  <option value="">No models found</option>
-                ) : null}
+                {modelOptionsWithFallback.length === 0 ? <option value="">No models found</option> : null}
                 {modelOptionsWithFallback.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
@@ -646,9 +413,7 @@ export const AgentInspectPanel = ({
                 value={heartbeatTargetMode}
                 disabled={heartbeatLoading || heartbeatSaving}
                 onChange={(event) => {
-                  setHeartbeatTargetMode(
-                    event.target.value as "last" | "none" | "custom"
-                  );
+                  setHeartbeatTargetMode(event.target.value as "last" | "none" | "custom");
                   setHeartbeatOverride(true);
                   setHeartbeatDirty(true);
                 }}

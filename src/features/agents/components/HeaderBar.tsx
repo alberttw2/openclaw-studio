@@ -1,14 +1,20 @@
 import { ThemeToggle } from "@/components/theme-toggle";
-import { Ellipsis } from "lucide-react";
+import { Brain, Ellipsis } from "lucide-react";
 
 type HeaderBarProps = {
   agentCount: number;
   onConnectionSettings: () => void;
+  onBrainFiles: () => void;
+  brainFilesOpen: boolean;
+  brainDisabled?: boolean;
 };
 
 export const HeaderBar = ({
   agentCount,
   onConnectionSettings,
+  onBrainFiles,
+  brainFilesOpen,
+  brainDisabled = false,
 }: HeaderBarProps) => {
   return (
     <div className="glass-panel fade-up relative overflow-hidden px-4 py-4 sm:px-6">
@@ -25,6 +31,20 @@ export const HeaderBar = ({
 
         <div className="flex items-center justify-end gap-2">
           <ThemeToggle />
+          <button
+            className={`flex items-center gap-2 rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] transition ${
+              brainFilesOpen
+                ? "border-border bg-muted text-foreground"
+                : "border-input/90 bg-background/75 text-foreground hover:border-ring hover:bg-card"
+            }`}
+            type="button"
+            onClick={onBrainFiles}
+            data-testid="brain-files-toggle"
+            disabled={brainDisabled}
+          >
+            <Brain className="h-4 w-4" />
+            Brain
+          </button>
           <details className="group relative">
             <summary className="flex h-9 w-9 cursor-pointer list-none items-center justify-center rounded-md border border-input/80 bg-background/70 text-muted-foreground transition hover:border-ring hover:bg-card hover:text-foreground [&::-webkit-details-marker]:hidden">
               <Ellipsis className="h-4 w-4" />
