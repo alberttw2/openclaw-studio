@@ -33,13 +33,26 @@ const injectAuthToken = (params, token) => {
   return next;
 };
 
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "0.0.0.0"]);
+
+const normalizeLoopbackUrl = (rawUrl) => {
+  try {
+    const parsed = new URL(rawUrl);
+    if (!LOOPBACK_HOSTNAMES.has(parsed.hostname)) return rawUrl;
+    const host = parsed.port ? `localhost:${parsed.port}` : "localhost";
+    const dropDefaultPath =
+      parsed.pathname === "/" && !rawUrl.endsWith("/") && !parsed.search && !parsed.hash;
+    const pathname = dropDefaultPath ? "" : parsed.pathname;
+    return `${parsed.protocol}//${host}${pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return rawUrl;
+  }
+};
+
 const resolveOriginForUpstream = (upstreamUrl) => {
   const url = new URL(upstreamUrl);
   const proto = url.protocol === "wss:" ? "https:" : "http:";
-  const hostname =
-    url.hostname === "127.0.0.1" || url.hostname === "::1" || url.hostname === "0.0.0.0"
-      ? "localhost"
-      : url.hostname;
+  const hostname = LOOPBACK_HOSTNAMES.has(url.hostname) ? "localhost" : url.hostname;
   const host = url.port ? `${hostname}:${url.port}` : hostname;
   return `${proto}//${host}`;
 };
@@ -130,6 +143,8 @@ function createGatewayProxy(options) {
           sendConnectError("studio.settings_load_failed", "Failed to load Studio gateway settings.");
           return;
         }
+
+        upstreamUrl = normalizeLoopbackUrl(upstreamUrl);
 
         if (!upstreamUrl) {
           sendConnectError(

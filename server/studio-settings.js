@@ -59,6 +59,23 @@ const readJsonFile = (filePath) => {
 const DEFAULT_GATEWAY_URL = "ws://localhost:18789";
 const OPENCLAW_CONFIG_FILENAME = "openclaw.json";
 
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "0.0.0.0"]);
+
+const normalizeLoopbackUrl = (rawUrl) => {
+  if (!rawUrl) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    if (!LOOPBACK_HOSTNAMES.has(parsed.hostname)) return rawUrl;
+    const host = parsed.port ? `localhost:${parsed.port}` : "localhost";
+    const dropDefaultPath =
+      parsed.pathname === "/" && !rawUrl.endsWith("/") && !parsed.search && !parsed.hash;
+    const pathname = dropDefaultPath ? "" : parsed.pathname;
+    return `${parsed.protocol}//${host}${pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return rawUrl;
+  }
+};
+
 const isRecord = (value) => Boolean(value && typeof value === "object");
 
 const readOpenclawGatewayDefaults = (env = process.env) => {
@@ -86,7 +103,8 @@ const loadUpstreamGatewaySettings = (env = process.env) => {
   const settingsPath = resolveStudioSettingsPath(env);
   const parsed = readJsonFile(settingsPath);
   const gateway = parsed && typeof parsed === "object" ? parsed.gateway : null;
-  const url = typeof gateway?.url === "string" ? gateway.url.trim() : "";
+  const rawUrl = typeof gateway?.url === "string" ? gateway.url.trim() : "";
+  const url = normalizeLoopbackUrl(rawUrl);
   const token = typeof gateway?.token === "string" ? gateway.token.trim() : "";
   if (!token) {
     const defaults = readOpenclawGatewayDefaults(env);
