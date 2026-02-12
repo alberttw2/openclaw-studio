@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { ThemeToggle } from "@/components/theme-toggle";
 import type { GatewayStatus } from "@/lib/gateway/GatewayClient";
-import { Brain, Plug } from "lucide-react";
+import { Brain, LayoutDashboard, Plug } from "lucide-react";
 
 type HeaderBarProps = {
   status: GatewayStatus;
@@ -20,6 +21,7 @@ export const HeaderBar = ({
   brainDisabled = false,
   showConnectionSettings = true,
 }: HeaderBarProps) => {
+  const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -60,6 +62,15 @@ export const HeaderBar = ({
             </span>
           ) : null}
           <ThemeToggle />
+          <button
+            className="flex items-center gap-2 rounded-md border border-input/90 bg-surface-3 px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-foreground transition hover:border-border hover:bg-surface-2"
+            type="button"
+            onClick={() => router.push("/dashboard")}
+            data-testid="dashboard-link"
+          >
+            <LayoutDashboard className="h-4 w-4" />
+            Dashboard
+          </button>
           <button
             className={`flex items-center gap-2 rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] transition ${
               brainFilesOpen

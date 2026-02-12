@@ -1,0 +1,1560 @@
+From 5dc1f138ae6bb5c680162ddb61c1c8c4a461f6ee Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 12 Feb 2026 18:20:40 +0000
+Subject: [PATCH] feat: add agent dashboard with color-coded actions, activity
+ feed, and task manager
+
+Adds a new /dashboard route with three major features:
+
+- Color-coded action system: 8 action categories (chat, tool_call, config_change,
+  cron_run, heartbeat, session, error, agent_lifecycle) each with distinct
+  semantic colors for light/dark modes
+- Activity Feed: Real-time timeline of agent actions with category filtering,
+  relative timestamps, and visual timeline
+- Dashboard Overview: Metrics cards (total agents, running, idle, errors),
+  activity distribution bar, and agent fleet grid with status indicators
+- Task Manager: Kanban board with drag-and-drop (open, in_progress, blocked,
+  done), priority levels, agent assignment, and localStorage persistence
+- Navigation: Dashboard button in Studio HeaderBar, back-to-Studio in Dashboard
+
+New files:
+- src/features/dashboard/types.ts
+- src/features/dashboard/useActionLog.ts
+- src/features/dashboard/components/ActivityFeed.tsx
+- src/features/dashboard/components/DashboardOverview.tsx
+- src/features/dashboard/components/TaskManager.tsx
+- src/app/dashboard/page.tsx
+
+Modified:
+- src/features/agents/components/HeaderBar.tsx (added Dashboard nav button)
+
+https://claude.ai/code/session_01F6TyeYNfRE5WUonYA8oLxr
+---
+ src/app/dashboard/page.tsx                    | 408 ++++++++++++++++++
+ src/features/agents/components/HeaderBar.tsx  |  13 +-
+ .../dashboard/components/ActivityFeed.tsx     | 157 +++++++
+ .../components/DashboardOverview.tsx          | 200 +++++++++
+ .../dashboard/components/TaskManager.tsx      | 284 ++++++++++++
+ src/features/dashboard/types.ts               | 218 ++++++++++
+ src/features/dashboard/useActionLog.ts        | 169 ++++++++
+ 7 files changed, 1448 insertions(+), 1 deletion(-)
+ create mode 100644 src/app/dashboard/page.tsx
+ create mode 100644 src/features/dashboard/components/ActivityFeed.tsx
+ create mode 100644 src/features/dashboard/components/DashboardOverview.tsx
+ create mode 100644 src/features/dashboard/components/TaskManager.tsx
+ create mode 100644 src/features/dashboard/types.ts
+ create mode 100644 src/features/dashboard/useActionLog.ts
+
+diff --git a/src/app/dashboard/page.tsx b/src/app/dashboard/page.tsx
+new file mode 100644
+index 0000000..d929be7
+--- /dev/null
++++ b/src/app/dashboard/page.tsx
+@@ -0,0 +1,408 @@
++"use client";
++
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import { useRouter } from "next/navigation";
++import { ThemeToggle } from "@/components/theme-toggle";
++import {
++  AgentStoreProvider,
++  useAgentStore,
++  getFilteredAgents,
++} from "@/features/agents/state/store";
++import { useGatewayConnection } from "@/lib/gateway/GatewayClient";
++import {
++  isGatewayDisconnectLikeError,
++  type EventFrame,
++} from "@/lib/gateway/GatewayClient";
++import { createGatewayRuntimeEventHandler } from "@/features/agents/state/gatewayRuntimeEventHandler";
++import {
++  buildSummarySnapshotPatches,
++  type SummaryPreviewSnapshot,
++  type SummaryStatusSnapshot,
++} from "@/features/agents/state/runtimeEventBridge";
++import { hydrateAgentFleetFromGateway } from "@/features/agents/operations/agentFleetHydration";
++import { createStudioSettingsCoordinator } from "@/lib/studio/coordinator";
++import { createRafBatcher } from "@/lib/dom";
++import type { AgentState } from "@/features/agents/state/store";
++import type {
++  GatewayModelPolicySnapshot,
++} from "@/lib/gateway/models";
++
++import { DashboardOverview } from "@/features/dashboard/components/DashboardOverview";
++import { ActivityFeed } from "@/features/dashboard/components/ActivityFeed";
++import { TaskManager } from "@/features/dashboard/components/TaskManager";
++import { useActionLog } from "@/features/dashboard/useActionLog";
++import type { TaskItem } from "@/features/dashboard/types";
++import { GatewayConnectScreen } from "@/features/agents/components/GatewayConnectScreen";
++import { LayoutDashboard, ArrowLeft } from "lucide-react";
++
++type DashboardTab = "overview" | "activity" | "tasks";
++
++const TABS: Array<{ value: DashboardTab; label: string }> = [
++  { value: "overview", label: "Overview" },
++  { value: "activity", label: "Activity Feed" },
++  { value: "tasks", label: "Task Board" },
++];
++
++const DashboardInner = () => {
++  const router = useRouter();
++  const [settingsCoordinator] = useState(() => createStudioSettingsCoordinator());
++  const {
++    client,
++    status,
++    gatewayUrl,
++    token,
++    localGatewayDefaults,
++    error: gatewayError,
++    connect,
++    setGatewayUrl,
++    setToken,
++    useLocalGatewayDefaults,
++  } = useGatewayConnection(settingsCoordinator);
++
++  const { state, dispatch, hydrateAgents, setError, setLoading } = useAgentStore();
++  const [agentsLoadedOnce, setAgentsLoadedOnce] = useState(false);
++  const [didAttemptConnect, setDidAttemptConnect] = useState(false);
++  const [activeTab, setActiveTab] = useState<DashboardTab>("overview");
++  const [tasks, setTasks] = useState<TaskItem[]>(() => {
++    if (typeof window === "undefined") return [];
++    try {
++      const saved = localStorage.getItem("openclaw-dashboard-tasks");
++      return saved ? JSON.parse(saved) : [];
++    } catch {
++      return [];
++    }
++  });
++  const stateRef = useRef(state);
++  const [gatewayConfigSnapshot, setGatewayConfigSnapshot] =
++    useState<GatewayModelPolicySnapshot | null>(null);
++  const pendingLivePatchesRef = useRef<Map<string, Partial<AgentState>>>(new Map());
++  const flushLivePatchesRef = useRef<() => void>(() => {});
++  const livePatchBatcherRef = useRef(createRafBatcher(() => flushLivePatchesRef.current()));
++  const runtimeEventHandlerRef = useRef<ReturnType<typeof createGatewayRuntimeEventHandler> | null>(null);
++
++  const agents = state.agents;
++  const allAgents = useMemo(() => getFilteredAgents(state, "all"), [state]);
++  const { actions } = useActionLog(agents);
++
++  // Persist tasks to localStorage
++  useEffect(() => {
++    try {
++      localStorage.setItem("openclaw-dashboard-tasks", JSON.stringify(tasks));
++    } catch {
++      // ignore
++    }
++  }, [tasks]);
++
++  useEffect(() => {
++    stateRef.current = state;
++  }, [state]);
++
++  const flushPendingLivePatches = useCallback(() => {
++    const pending = pendingLivePatchesRef.current;
++    if (pending.size === 0) return;
++    const entries = [...pending.entries()];
++    pending.clear();
++    for (const [agentId, patch] of entries) {
++      dispatch({ type: "updateAgent", agentId, patch });
++    }
++  }, [dispatch]);
++
++  useEffect(() => {
++    flushLivePatchesRef.current = flushPendingLivePatches;
++  }, [flushPendingLivePatches]);
++
++  const queueLivePatch = useCallback((agentId: string, patch: Partial<AgentState>) => {
++    const key = agentId.trim();
++    if (!key) return;
++    const existing = pendingLivePatchesRef.current.get(key);
++    pendingLivePatchesRef.current.set(key, existing ? { ...existing, ...patch } : patch);
++    livePatchBatcherRef.current.schedule();
++  }, []);
++
++  const clearPendingLivePatch = useCallback((agentId: string) => {
++    const key = agentId.trim();
++    if (!key) return;
++    pendingLivePatchesRef.current.delete(key);
++    if (pendingLivePatchesRef.current.size === 0) {
++      livePatchBatcherRef.current.cancel();
++    }
++  }, []);
++
++  const loadSummarySnapshot = useCallback(async () => {
++    const activeAgents = stateRef.current.agents.filter((a) => a.sessionCreated);
++    const sessionKeys = Array.from(
++      new Set(
++        activeAgents
++          .map((a) => a.sessionKey)
++          .filter((k): k is string => typeof k === "string" && k.trim().length > 0)
++      )
++    ).slice(0, 64);
++    if (sessionKeys.length === 0) return;
++    try {
++      const [statusSummary, previewResult] = await Promise.all([
++        client.call<SummaryStatusSnapshot>("status", {}),
++        client.call<SummaryPreviewSnapshot>("sessions.preview", {
++          keys: sessionKeys,
++          limit: 8,
++          maxChars: 240,
++        }),
++      ]);
++      for (const entry of buildSummarySnapshotPatches({
++        agents: activeAgents,
++        statusSummary,
++        previewResult,
++      })) {
++        dispatch({ type: "updateAgent", agentId: entry.agentId, patch: entry.patch });
++      }
++    } catch (err) {
++      if (!isGatewayDisconnectLikeError(err)) {
++        console.error("Failed to load summary snapshot.", err);
++      }
++    }
++  }, [client, dispatch]);
++
++  const loadAgentHistory = useCallback(
++    async (agentId: string) => {
++      // Minimal history load for dashboard — just trigger a summary refresh
++      void loadSummarySnapshot();
++    },
++    [loadSummarySnapshot]
++  );
++
++  const loadAgents = useCallback(async () => {
++    if (status !== "connected") return;
++    setLoading(true);
++    try {
++      const result = await hydrateAgentFleetFromGateway({
++        client,
++        gatewayUrl,
++        cachedConfigSnapshot: gatewayConfigSnapshot,
++        loadStudioSettings: () => settingsCoordinator.loadSettings(),
++        isDisconnectLikeError: isGatewayDisconnectLikeError,
++        logError: (message, error) => console.error(message, error),
++      });
++      if (!gatewayConfigSnapshot && result.configSnapshot) {
++        setGatewayConfigSnapshot(result.configSnapshot);
++      }
++      hydrateAgents(result.seeds);
++      for (const agentId of result.sessionCreatedAgentIds) {
++        dispatch({
++          type: "updateAgent",
++          agentId,
++          patch: { sessionCreated: true, sessionSettingsSynced: true },
++        });
++      }
++      for (const entry of result.summaryPatches) {
++        dispatch({ type: "updateAgent", agentId: entry.agentId, patch: entry.patch });
++      }
++    } catch (err) {
++      const message = err instanceof Error ? err.message : "Failed to load agents.";
++      setError(message);
++    } finally {
++      setLoading(false);
++      setAgentsLoadedOnce(true);
++    }
++  }, [client, dispatch, gatewayConfigSnapshot, gatewayUrl, hydrateAgents, setError, setLoading, settingsCoordinator, status]);
++
++  // Setup event handler
++  useEffect(() => {
++    const handler = createGatewayRuntimeEventHandler({
++      getStatus: () => status,
++      getAgents: () => stateRef.current.agents,
++      dispatch,
++      queueLivePatch,
++      clearPendingLivePatch,
++      loadSummarySnapshot,
++      loadAgentHistory,
++      refreshHeartbeatLatestUpdate: () => {},
++      bumpHeartbeatTick: () => {},
++      setTimeout: (fn, delayMs) => window.setTimeout(fn, delayMs),
++      clearTimeout: (id) => window.clearTimeout(id),
++      isDisconnectLikeError: isGatewayDisconnectLikeError,
++      logWarn: (message, meta) => console.warn(message, meta),
++      updateSpecialLatestUpdate: () => {},
++    });
++    runtimeEventHandlerRef.current = handler;
++    const unsubscribe = client.onEvent((event: EventFrame) => handler.handleEvent(event));
++    return () => {
++      runtimeEventHandlerRef.current = null;
++      handler.dispose();
++      unsubscribe();
++    };
++  }, [client, clearPendingLivePatch, dispatch, loadAgentHistory, loadSummarySnapshot, queueLivePatch, status]);
++
++  // Load agents on connect
++  useEffect(() => {
++    if (status !== "connected") return;
++    void loadAgents();
++  }, [loadAgents, status]);
++
++  // Summary polling
++  useEffect(() => {
++    if (status !== "connected") return;
++    void loadSummarySnapshot();
++    const timer = window.setInterval(() => void loadSummarySnapshot(), 5000);
++    return () => window.clearInterval(timer);
++  }, [loadSummarySnapshot, status]);
++
++  useEffect(() => {
++    if (status === "connecting") setDidAttemptConnect(true);
++  }, [status]);
++
++  useEffect(() => {
++    if (gatewayError) setDidAttemptConnect(true);
++  }, [gatewayError]);
++
++  // Cleanup
++  useEffect(() => {
++    const batcher = livePatchBatcherRef.current;
++    const pending = pendingLivePatchesRef.current;
++    return () => {
++      batcher.cancel();
++      pending.clear();
++    };
++  }, []);
++
++  const handleSelectAgent = useCallback(
++    (agentId: string) => {
++      dispatch({ type: "selectAgent", agentId });
++      router.push("/");
++    },
++    [dispatch, router]
++  );
++
++  // Gateway connect screen
++  if (status === "disconnected" && !agentsLoadedOnce && didAttemptConnect) {
++    return (
++      <div className="relative min-h-screen w-screen overflow-hidden bg-background">
++        <div className="relative z-10 flex h-screen flex-col gap-4 px-3 py-3 sm:px-4 sm:py-4 md:px-6 md:py-6">
++          <DashboardHeader activeTab={activeTab} onTabChange={setActiveTab} />
++          <GatewayConnectScreen
++            gatewayUrl={gatewayUrl}
++            token={token}
++            localGatewayDefaults={localGatewayDefaults}
++            status={status}
++            error={gatewayError}
++            onGatewayUrlChange={setGatewayUrl}
++            onTokenChange={setToken}
++            onUseLocalDefaults={useLocalGatewayDefaults}
++            onConnect={() => void connect()}
++          />
++        </div>
++      </div>
++    );
++  }
++
++  // Loading state
++  if (!agentsLoadedOnce && (status === "connecting" || !didAttemptConnect)) {
++    return (
++      <div className="relative min-h-screen w-screen overflow-hidden bg-background">
++        <div className="flex min-h-screen items-center justify-center px-6">
++          <div className="glass-panel w-full max-w-md px-6 py-6 text-center">
++            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
++              OpenClaw Dashboard
++            </div>
++            <div className="mt-3 text-sm text-muted-foreground">
++              {status === "connecting" ? "Connecting to gateway..." : "Booting Dashboard..."}
++            </div>
++          </div>
++        </div>
++      </div>
++    );
++  }
++
++  return (
++    <div className="relative min-h-screen w-screen overflow-hidden bg-background">
++      <div className="relative z-10 flex h-screen flex-col gap-3 px-3 py-3 sm:px-4 sm:py-4 md:px-5 md:py-5">
++        <DashboardHeader activeTab={activeTab} onTabChange={setActiveTab} />
++
++        {state.error ? (
++          <div className="w-full">
++            <div className="rounded-md border border-destructive bg-destructive px-4 py-2 text-sm text-destructive-foreground">
++              {state.error}
++            </div>
++          </div>
++        ) : null}
++
++        <div className="min-h-0 flex-1 overflow-auto">
++          {activeTab === "overview" ? (
++            <DashboardOverview
++              agents={allAgents}
++              actions={actions}
++              onSelectAgent={handleSelectAgent}
++            />
++          ) : activeTab === "activity" ? (
++            <ActivityFeed actions={actions} maxVisible={100} />
++          ) : (
++            <TaskManager
++              agents={allAgents}
++              tasks={tasks}
++              onTasksChange={setTasks}
++            />
++          )}
++        </div>
++      </div>
++    </div>
++  );
++};
++
++const DashboardHeader = ({
++  activeTab,
++  onTabChange,
++}: {
++  activeTab: DashboardTab;
++  onTabChange: (tab: DashboardTab) => void;
++}) => {
++  const router = useRouter();
++  return (
++    <div className="glass-panel fade-up relative z-[180] px-4 py-2">
++      <div className="flex items-center justify-between gap-4">
++        <div className="flex items-center gap-3">
++          <button
++            type="button"
++            className="flex items-center gap-1.5 rounded-md border border-input/80 bg-surface-3 px-2 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground transition hover:border-border hover:bg-surface-2 hover:text-foreground"
++            onClick={() => router.push("/")}
++          >
++            <ArrowLeft className="h-3 w-3" />
++            Studio
++          </button>
++          <div className="flex items-center gap-2">
++            <LayoutDashboard className="h-5 w-5 text-primary" />
++            <p className="console-title text-2xl leading-none text-foreground sm:text-3xl">
++              Dashboard
++            </p>
++          </div>
++        </div>
++
++        <div className="flex items-center gap-2">
++          {TABS.map((tab) => {
++            const active = activeTab === tab.value;
++            return (
++              <button
++                key={tab.value}
++                type="button"
++                className={`rounded-md border px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] transition ${
++                  active
++                    ? "border-border bg-surface-2 text-foreground"
++                    : "border-border/60 bg-transparent text-muted-foreground hover:border-border hover:bg-surface-2"
++                }`}
++                onClick={() => onTabChange(tab.value)}
++              >
++                {tab.label}
++              </button>
++            );
++          })}
++          <ThemeToggle />
++        </div>
++      </div>
++    </div>
++  );
++};
++
++export default function DashboardPage() {
++  return (
++    <AgentStoreProvider>
++      <DashboardInner />
++    </AgentStoreProvider>
++  );
++}
+diff --git a/src/features/agents/components/HeaderBar.tsx b/src/features/agents/components/HeaderBar.tsx
+index b90097d..04b40f2 100644
+--- a/src/features/agents/components/HeaderBar.tsx
++++ b/src/features/agents/components/HeaderBar.tsx
+@@ -1,7 +1,8 @@
+ import { useEffect, useRef, useState } from "react";
++import { useRouter } from "next/navigation";
+ import { ThemeToggle } from "@/components/theme-toggle";
+ import type { GatewayStatus } from "@/lib/gateway/GatewayClient";
+-import { Brain, Plug } from "lucide-react";
++import { Brain, LayoutDashboard, Plug } from "lucide-react";
+ 
+ type HeaderBarProps = {
+   status: GatewayStatus;
+@@ -20,6 +21,7 @@ export const HeaderBar = ({
+   brainDisabled = false,
+   showConnectionSettings = true,
+ }: HeaderBarProps) => {
++  const router = useRouter();
+   const [menuOpen, setMenuOpen] = useState(false);
+   const menuRef = useRef<HTMLDivElement | null>(null);
+ 
+@@ -60,6 +62,15 @@ export const HeaderBar = ({
+             </span>
+           ) : null}
+           <ThemeToggle />
++          <button
++            className="flex items-center gap-2 rounded-md border border-input/90 bg-surface-3 px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-foreground transition hover:border-border hover:bg-surface-2"
++            type="button"
++            onClick={() => router.push("/dashboard")}
++            data-testid="dashboard-link"
++          >
++            <LayoutDashboard className="h-4 w-4" />
++            Dashboard
++          </button>
+           <button
+             className={`flex items-center gap-2 rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] transition ${
+               brainFilesOpen
+diff --git a/src/features/dashboard/components/ActivityFeed.tsx b/src/features/dashboard/components/ActivityFeed.tsx
+new file mode 100644
+index 0000000..8090f8e
+--- /dev/null
++++ b/src/features/dashboard/components/ActivityFeed.tsx
+@@ -0,0 +1,157 @@
++"use client";
++
++import { useMemo, useState } from "react";
++import {
++  type ActionCategory,
++  type ActionEntry,
++  ACTION_STYLES,
++} from "../types";
++
++type ActivityFeedProps = {
++  actions: ActionEntry[];
++  maxVisible?: number;
++};
++
++const CATEGORY_FILTERS: Array<{ value: ActionCategory | "all"; label: string }> = [
++  { value: "all", label: "All" },
++  { value: "chat", label: "Chat" },
++  { value: "tool_call", label: "Tools" },
++  { value: "config_change", label: "Config" },
++  { value: "cron_run", label: "Cron" },
++  { value: "heartbeat", label: "Heartbeat" },
++  { value: "session", label: "Session" },
++  { value: "error", label: "Errors" },
++  { value: "agent_lifecycle", label: "Lifecycle" },
++];
++
++const formatRelativeTime = (timestamp: number): string => {
++  const diff = Date.now() - timestamp;
++  const seconds = Math.floor(diff / 1000);
++  if (seconds < 5) return "just now";
++  if (seconds < 60) return `${seconds}s ago`;
++  const minutes = Math.floor(seconds / 60);
++  if (minutes < 60) return `${minutes}m ago`;
++  const hours = Math.floor(minutes / 60);
++  if (hours < 24) return `${hours}h ago`;
++  const days = Math.floor(hours / 24);
++  return `${days}d ago`;
++};
++
++export const ActivityFeed = ({ actions, maxVisible = 50 }: ActivityFeedProps) => {
++  const [filter, setFilter] = useState<ActionCategory | "all">("all");
++
++  const filtered = useMemo(() => {
++    const source = filter === "all" ? actions : actions.filter((a) => a.category === filter);
++    return source
++      .sort((a, b) => b.timestamp - a.timestamp)
++      .slice(0, maxVisible);
++  }, [actions, filter, maxVisible]);
++
++  const categoryBreakdown = useMemo(() => {
++    const counts = new Map<ActionCategory, number>();
++    for (const action of actions) {
++      counts.set(action.category, (counts.get(action.category) ?? 0) + 1);
++    }
++    return counts;
++  }, [actions]);
++
++  return (
++    <div className="flex h-full flex-col gap-3">
++      {/* Category legend bar */}
++      <div className="flex flex-wrap items-center gap-3 px-1">
++        {Array.from(categoryBreakdown.entries())
++          .sort((a, b) => b[1] - a[1])
++          .map(([cat, count]) => {
++            const style = ACTION_STYLES[cat];
++            return (
++              <div key={cat} className="flex items-center gap-1.5">
++                <span className={`inline-block h-2 w-2 rounded-full ${style.dot}`} />
++                <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
++                  {style.label}
++                </span>
++                <span className={`font-mono text-[9px] font-bold ${style.text}`}>
++                  {count}
++                </span>
++              </div>
++            );
++          })}
++      </div>
++
++      {/* Filters */}
++      <div className="flex flex-wrap gap-1.5">
++        {CATEGORY_FILTERS.map((opt) => {
++          const active = filter === opt.value;
++          return (
++            <button
++              key={opt.value}
++              type="button"
++              className={`rounded-md border px-2 py-1 font-mono text-[9px] font-semibold uppercase tracking-[0.12em] transition ${
++                active
++                  ? "border-border bg-surface-2 text-foreground"
++                  : "border-border/60 bg-transparent text-muted-foreground hover:border-border hover:bg-surface-2"
++              }`}
++              onClick={() => setFilter(opt.value)}
++            >
++              {opt.label}
++            </button>
++          );
++        })}
++      </div>
++
++      {/* Timeline */}
++      <div className="min-h-0 flex-1 overflow-auto">
++        {filtered.length === 0 ? (
++          <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
++            No actions recorded yet.
++          </div>
++        ) : (
++          <div className="relative pl-4">
++            {/* Vertical line */}
++            <div className="absolute left-[7px] top-1 bottom-1 w-px bg-border/60" />
++            <div className="flex flex-col gap-1">
++              {filtered.map((action) => {
++                const style = ACTION_STYLES[action.category];
++                return (
++                  <div
++                    key={action.id}
++                    className={`group relative rounded-md border ${style.border} ${style.bg} px-3 py-2 transition hover:brightness-105`}
++                  >
++                    {/* Dot on the timeline */}
++                    <div
++                      className={`absolute -left-4 top-3 h-2.5 w-2.5 rounded-full border-2 border-background ${style.dot}`}
++                    />
++                    <div className="flex items-start justify-between gap-2">
++                      <div className="min-w-0 flex-1">
++                        <div className="flex items-center gap-2">
++                          <span
++                            className={`rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-[0.12em] ${style.bg} ${style.text} border ${style.border}`}
++                          >
++                            {style.label}
++                          </span>
++                          <span className="truncate font-mono text-[10px] font-semibold text-foreground">
++                            {action.agentName}
++                          </span>
++                        </div>
++                        <p className="mt-1 truncate text-[11px] leading-relaxed text-foreground/80">
++                          {action.summary}
++                        </p>
++                        {action.detail ? (
++                          <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
++                            {action.detail}
++                          </p>
++                        ) : null}
++                      </div>
++                      <span className="shrink-0 font-mono text-[9px] text-muted-foreground">
++                        {formatRelativeTime(action.timestamp)}
++                      </span>
++                    </div>
++                  </div>
++                );
++              })}
++            </div>
++          </div>
++        )}
++      </div>
++    </div>
++  );
++};
+diff --git a/src/features/dashboard/components/DashboardOverview.tsx b/src/features/dashboard/components/DashboardOverview.tsx
+new file mode 100644
+index 0000000..966590d
+--- /dev/null
++++ b/src/features/dashboard/components/DashboardOverview.tsx
+@@ -0,0 +1,200 @@
++"use client";
++
++import { useMemo } from "react";
++import type { AgentState } from "@/features/agents/state/store";
++import { AgentAvatar } from "@/features/agents/components/AgentAvatar";
++import type { ActionEntry } from "../types";
++import { ACTION_STYLES } from "../types";
++
++type DashboardOverviewProps = {
++  agents: AgentState[];
++  actions: ActionEntry[];
++  onSelectAgent: (agentId: string) => void;
++};
++
++const formatTimestamp = (ts: number | null): string => {
++  if (!ts) return "--";
++  const d = new Date(ts);
++  const now = new Date();
++  const diff = now.getTime() - ts;
++  if (diff < 60_000) return "just now";
++  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
++  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
++  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
++};
++
++const StatusDot = ({ status }: { status: AgentState["status"] }) => {
++  const colors: Record<AgentState["status"], string> = {
++    idle: "bg-slate-400",
++    running: "bg-emerald-500 animate-pulse",
++    error: "bg-red-500",
++  };
++  return <span className={`inline-block h-2 w-2 rounded-full ${colors[status]}`} />;
++};
++
++export const DashboardOverview = ({
++  agents,
++  actions,
++  onSelectAgent,
++}: DashboardOverviewProps) => {
++  const stats = useMemo(() => {
++    const total = agents.length;
++    const running = agents.filter((a) => a.status === "running").length;
++    const idle = agents.filter((a) => a.status === "idle").length;
++    const errored = agents.filter((a) => a.status === "error").length;
++    const totalActions = actions.length;
++    const last5min = actions.filter((a) => Date.now() - a.timestamp < 300_000).length;
++    const errors = actions.filter((a) => a.category === "error").length;
++    return { total, running, idle, errored, totalActions, last5min, errors };
++  }, [agents, actions]);
++
++  const recentActionsByCategory = useMemo(() => {
++    const counts = new Map<string, number>();
++    const recent = actions.filter((a) => Date.now() - a.timestamp < 3_600_000);
++    for (const action of recent) {
++      counts.set(action.category, (counts.get(action.category) ?? 0) + 1);
++    }
++    return Array.from(counts.entries())
++      .sort((a, b) => b[1] - a[1])
++      .slice(0, 6);
++  }, [actions]);
++
++  const sortedAgents = useMemo(() => {
++    return [...agents].sort((a, b) => {
++      const statusOrder = { running: 0, error: 1, idle: 2 };
++      const diff = statusOrder[a.status] - statusOrder[b.status];
++      if (diff !== 0) return diff;
++      return (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0);
++    });
++  }, [agents]);
++
++  return (
++    <div className="flex flex-col gap-4">
++      {/* Metrics Row */}
++      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
++        <MetricCard label="Total Agents" value={stats.total} color="text-foreground" />
++        <MetricCard label="Running" value={stats.running} color="text-emerald-500" />
++        <MetricCard label="Idle" value={stats.idle} color="text-slate-500 dark:text-slate-400" />
++        <MetricCard label="Errors" value={stats.errored} color="text-red-500" />
++        <MetricCard label="Actions (5m)" value={stats.last5min} color="text-sky-500" />
++        <MetricCard label="Total Errors" value={stats.errors} color="text-red-400" />
++      </div>
++
++      {/* Activity distribution bar */}
++      {recentActionsByCategory.length > 0 ? (
++        <div className="glass-panel px-4 py-3">
++          <p className="mb-2 font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
++            Activity (Last Hour)
++          </p>
++          <div className="flex h-3 w-full overflow-hidden rounded-full bg-surface-2">
++            {recentActionsByCategory.map(([cat, count]) => {
++              const total = recentActionsByCategory.reduce((s, [, c]) => s + c, 0);
++              const pct = Math.max(2, (count / total) * 100);
++              const style = ACTION_STYLES[cat as keyof typeof ACTION_STYLES];
++              return (
++                <div
++                  key={cat}
++                  className={`${style?.dot ?? "bg-slate-400"} transition-all duration-500`}
++                  style={{ width: `${pct}%` }}
++                  title={`${style?.label ?? cat}: ${count}`}
++                />
++              );
++            })}
++          </div>
++          <div className="mt-2 flex flex-wrap gap-3">
++            {recentActionsByCategory.map(([cat, count]) => {
++              const style = ACTION_STYLES[cat as keyof typeof ACTION_STYLES];
++              return (
++                <div key={cat} className="flex items-center gap-1.5">
++                  <span className={`inline-block h-2 w-2 rounded-full ${style?.dot ?? "bg-slate-400"}`} />
++                  <span className="font-mono text-[9px] text-muted-foreground">
++                    {style?.label ?? cat}: {count}
++                  </span>
++                </div>
++              );
++            })}
++          </div>
++        </div>
++      ) : null}
++
++      {/* Agent Fleet Grid */}
++      <div>
++        <p className="mb-2 px-1 font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
++          Agent Fleet
++        </p>
++        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
++          {sortedAgents.map((agent) => {
++            const avatarSeed = agent.avatarSeed ?? agent.agentId;
++            return (
++              <button
++                key={agent.agentId}
++                type="button"
++                className="group rounded-md border border-border/70 bg-surface-1 px-3 py-3 text-left transition hover:border-border hover:bg-surface-2"
++                onClick={() => onSelectAgent(agent.agentId)}
++              >
++                <div className="flex items-center gap-3">
++                  <AgentAvatar
++                    seed={avatarSeed}
++                    name={agent.name}
++                    avatarUrl={agent.avatarUrl ?? null}
++                    size={32}
++                    isSelected={false}
++                  />
++                  <div className="min-w-0 flex-1">
++                    <div className="flex items-center gap-2">
++                      <p className="truncate text-[11px] font-semibold uppercase tracking-[0.12em] text-foreground">
++                        {agent.name}
++                      </p>
++                      <StatusDot status={agent.status} />
++                    </div>
++                    <p className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground">
++                      {agent.model ?? "default"} &middot; {formatTimestamp(agent.lastActivityAt)}
++                    </p>
++                  </div>
++                </div>
++                {agent.latestPreview ? (
++                  <p className="mt-2 line-clamp-2 text-[10px] leading-relaxed text-foreground/70">
++                    {agent.latestPreview}
++                  </p>
++                ) : null}
++                {agent.latestOverrideKind ? (
++                  <div className="mt-1.5 flex items-center gap-1.5">
++                    <span
++                      className={`inline-block h-1.5 w-1.5 rounded-full ${
++                        agent.latestOverrideKind === "heartbeat"
++                          ? "bg-teal-500"
++                          : "bg-emerald-500"
++                      }`}
++                    />
++                    <span className="font-mono text-[8px] uppercase tracking-[0.1em] text-muted-foreground">
++                      {agent.latestOverrideKind}
++                    </span>
++                  </div>
++                ) : null}
++              </button>
++            );
++          })}
++        </div>
++      </div>
++    </div>
++  );
++};
++
++const MetricCard = ({
++  label,
++  value,
++  color,
++}: {
++  label: string;
++  value: number;
++  color: string;
++}) => (
++  <div className="rounded-md border border-border/70 bg-surface-1 px-3 py-3">
++    <p className="font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
++      {label}
++    </p>
++    <p className={`mt-1 text-2xl font-bold tabular-nums ${color}`}>
++      {value}
++    </p>
++  </div>
++);
+diff --git a/src/features/dashboard/components/TaskManager.tsx b/src/features/dashboard/components/TaskManager.tsx
+new file mode 100644
+index 0000000..dddd363
+--- /dev/null
++++ b/src/features/dashboard/components/TaskManager.tsx
+@@ -0,0 +1,284 @@
++"use client";
++
++import { useCallback, useMemo, useState } from "react";
++import type { AgentState } from "@/features/agents/state/store";
++import {
++  type TaskItem,
++  type TaskStatus,
++  type TaskPriority,
++  TASK_STATUS_STYLES,
++  TASK_PRIORITY_STYLES,
++} from "../types";
++
++type TaskManagerProps = {
++  agents: AgentState[];
++  tasks: TaskItem[];
++  onTasksChange: (tasks: TaskItem[]) => void;
++};
++
++const TASK_COLUMNS: TaskStatus[] = ["open", "in_progress", "blocked", "done"];
++
++const formatDate = (ts: number): string => {
++  const d = new Date(ts);
++  return d.toLocaleDateString(undefined, {
++    month: "short",
++    day: "numeric",
++    hour: "2-digit",
++    minute: "2-digit",
++  });
++};
++
++export const TaskManager = ({ agents, tasks, onTasksChange }: TaskManagerProps) => {
++  const [showCreateForm, setShowCreateForm] = useState(false);
++  const [newTitle, setNewTitle] = useState("");
++  const [newDescription, setNewDescription] = useState("");
++  const [newPriority, setNewPriority] = useState<TaskPriority>("medium");
++  const [newAgentId, setNewAgentId] = useState<string>("");
++  const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
++
++  const tasksByStatus = useMemo(() => {
++    const map = new Map<TaskStatus, TaskItem[]>();
++    for (const status of TASK_COLUMNS) {
++      map.set(status, []);
++    }
++    for (const task of tasks) {
++      const bucket = map.get(task.status);
++      if (bucket) bucket.push(task);
++    }
++    for (const [, bucket] of map) {
++      bucket.sort((a, b) => {
++        const priorityOrder: Record<TaskPriority, number> = {
++          critical: 0,
++          high: 1,
++          medium: 2,
++          low: 3,
++        };
++        const diff = priorityOrder[a.priority] - priorityOrder[b.priority];
++        if (diff !== 0) return diff;
++        return b.updatedAt - a.updatedAt;
++      });
++    }
++    return map;
++  }, [tasks]);
++
++  const handleCreate = useCallback(() => {
++    const trimmed = newTitle.trim();
++    if (!trimmed) return;
++    const now = Date.now();
++    const agent = agents.find((a) => a.agentId === newAgentId) ?? null;
++    const task: TaskItem = {
++      id: `task-${now}-${Math.random().toString(36).slice(2, 8)}`,
++      title: trimmed,
++      description: newDescription.trim() || undefined,
++      assignedAgentId: agent?.agentId ?? null,
++      assignedAgentName: agent?.name ?? null,
++      status: "open",
++      priority: newPriority,
++      createdAt: now,
++      updatedAt: now,
++    };
++    onTasksChange([...tasks, task]);
++    setNewTitle("");
++    setNewDescription("");
++    setNewPriority("medium");
++    setNewAgentId("");
++    setShowCreateForm(false);
++  }, [agents, newAgentId, newDescription, newPriority, newTitle, onTasksChange, tasks]);
++
++  const handleStatusChange = useCallback(
++    (taskId: string, newStatus: TaskStatus) => {
++      onTasksChange(
++        tasks.map((t) =>
++          t.id === taskId ? { ...t, status: newStatus, updatedAt: Date.now() } : t
++        )
++      );
++    },
++    [onTasksChange, tasks]
++  );
++
++  const handleDelete = useCallback(
++    (taskId: string) => {
++      onTasksChange(tasks.filter((t) => t.id !== taskId));
++    },
++    [onTasksChange, tasks]
++  );
++
++  const handleDragStart = useCallback((taskId: string) => {
++    setDraggedTaskId(taskId);
++  }, []);
++
++  const handleDrop = useCallback(
++    (targetStatus: TaskStatus) => {
++      if (!draggedTaskId) return;
++      handleStatusChange(draggedTaskId, targetStatus);
++      setDraggedTaskId(null);
++    },
++    [draggedTaskId, handleStatusChange]
++  );
++
++  return (
++    <div className="flex h-full flex-col gap-3">
++      {/* Header */}
++      <div className="flex items-center justify-between px-1">
++        <p className="font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
++          Tasks ({tasks.length})
++        </p>
++        <button
++          type="button"
++          className="rounded-md border border-transparent bg-primary px-3 py-1.5 font-mono text-[9px] font-semibold uppercase tracking-[0.12em] text-primary-foreground transition hover:brightness-105"
++          onClick={() => setShowCreateForm((prev) => !prev)}
++        >
++          {showCreateForm ? "Cancel" : "New Task"}
++        </button>
++      </div>
++
++      {/* Create form */}
++      {showCreateForm ? (
++        <div className="rounded-md border border-border/80 bg-surface-1 px-4 py-3">
++          <div className="flex flex-col gap-2">
++            <input
++              type="text"
++              placeholder="Task title..."
++              value={newTitle}
++              onChange={(e) => setNewTitle(e.target.value)}
++              className="w-full rounded-md border border-border/80 bg-surface-3 px-3 py-2 text-[11px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none"
++              onKeyDown={(e) => {
++                if (e.key === "Enter") handleCreate();
++              }}
++            />
++            <textarea
++              placeholder="Description (optional)..."
++              value={newDescription}
++              onChange={(e) => setNewDescription(e.target.value)}
++              rows={2}
++              className="w-full rounded-md border border-border/80 bg-surface-3 px-3 py-2 text-[11px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none"
++            />
++            <div className="flex flex-wrap gap-2">
++              <select
++                value={newPriority}
++                onChange={(e) => setNewPriority(e.target.value as TaskPriority)}
++                className="rounded-md border border-border/80 bg-surface-3 px-2 py-1.5 font-mono text-[10px] text-foreground"
++              >
++                <option value="low">Low</option>
++                <option value="medium">Medium</option>
++                <option value="high">High</option>
++                <option value="critical">Critical</option>
++              </select>
++              <select
++                value={newAgentId}
++                onChange={(e) => setNewAgentId(e.target.value)}
++                className="rounded-md border border-border/80 bg-surface-3 px-2 py-1.5 font-mono text-[10px] text-foreground"
++              >
++                <option value="">Unassigned</option>
++                {agents.map((agent) => (
++                  <option key={agent.agentId} value={agent.agentId}>
++                    {agent.name}
++                  </option>
++                ))}
++              </select>
++              <button
++                type="button"
++                className="rounded-md bg-primary px-3 py-1.5 font-mono text-[10px] font-semibold text-primary-foreground transition hover:brightness-105 disabled:opacity-50"
++                onClick={handleCreate}
++                disabled={!newTitle.trim()}
++              >
++                Create
++              </button>
++            </div>
++          </div>
++        </div>
++      ) : null}
++
++      {/* Kanban board */}
++      <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 overflow-auto sm:grid-cols-2 xl:grid-cols-4">
++        {TASK_COLUMNS.map((status) => {
++          const style = TASK_STATUS_STYLES[status];
++          const columnTasks = tasksByStatus.get(status) ?? [];
++          return (
++            <div
++              key={status}
++              className="flex flex-col gap-2 rounded-md border border-border/60 bg-surface-0 p-2"
++              onDragOver={(e) => e.preventDefault()}
++              onDrop={() => handleDrop(status)}
++            >
++              <div className="flex items-center justify-between px-1">
++                <div className="flex items-center gap-2">
++                  <span
++                    className={`rounded px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-[0.12em] ${style.bg} ${style.text} border ${style.border}`}
++                  >
++                    {style.label}
++                  </span>
++                  <span className="font-mono text-[9px] text-muted-foreground">
++                    {columnTasks.length}
++                  </span>
++                </div>
++              </div>
++              <div className="flex min-h-[100px] flex-col gap-1.5">
++                {columnTasks.map((task) => {
++                  const priorityStyle = TASK_PRIORITY_STYLES[task.priority];
++                  return (
++                    <div
++                      key={task.id}
++                      draggable
++                      onDragStart={() => handleDragStart(task.id)}
++                      className={`cursor-grab rounded-md border ${style.border} bg-surface-1 px-3 py-2 transition active:cursor-grabbing hover:bg-surface-2`}
++                    >
++                      <div className="flex items-start justify-between gap-1">
++                        <p className="text-[11px] font-semibold leading-tight text-foreground">
++                          {task.title}
++                        </p>
++                        <button
++                          type="button"
++                          className="shrink-0 font-mono text-[9px] text-muted-foreground hover:text-destructive"
++                          onClick={() => handleDelete(task.id)}
++                          title="Delete task"
++                        >
++                          x
++                        </button>
++                      </div>
++                      {task.description ? (
++                        <p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-foreground/70">
++                          {task.description}
++                        </p>
++                      ) : null}
++                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
++                        <span
++                          className={`rounded px-1 py-0.5 font-mono text-[7px] font-bold uppercase tracking-[0.1em] ${priorityStyle.bg} ${priorityStyle.text} border ${priorityStyle.border}`}
++                        >
++                          {priorityStyle.label}
++                        </span>
++                        {task.assignedAgentName ? (
++                          <span className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[8px] text-muted-foreground">
++                            {task.assignedAgentName}
++                          </span>
++                        ) : null}
++                      </div>
++                      <div className="mt-1 flex items-center justify-between">
++                        <span className="font-mono text-[8px] text-muted-foreground">
++                          {formatDate(task.updatedAt)}
++                        </span>
++                        <select
++                          value={task.status}
++                          onChange={(e) =>
++                            handleStatusChange(task.id, e.target.value as TaskStatus)
++                          }
++                          className="rounded border border-border/60 bg-transparent px-1 py-0.5 font-mono text-[8px] text-muted-foreground"
++                        >
++                          {TASK_COLUMNS.map((s) => (
++                            <option key={s} value={s}>
++                              {TASK_STATUS_STYLES[s].label}
++                            </option>
++                          ))}
++                        </select>
++                      </div>
++                    </div>
++                  );
++                })}
++              </div>
++            </div>
++          );
++        })}
++      </div>
++    </div>
++  );
++};
+diff --git a/src/features/dashboard/types.ts b/src/features/dashboard/types.ts
+new file mode 100644
+index 0000000..a4f05d3
+--- /dev/null
++++ b/src/features/dashboard/types.ts
+@@ -0,0 +1,218 @@
++/**
++ * Agent action classification and color-coding system for the OpenClaw Dashboard.
++ *
++ * Each action category maps to a semantic color that works in both light and dark modes.
++ */
++
++export type ActionCategory =
++  | "chat"
++  | "tool_call"
++  | "config_change"
++  | "cron_run"
++  | "heartbeat"
++  | "session"
++  | "error"
++  | "agent_lifecycle";
++
++export type ActionEntry = {
++  id: string;
++  agentId: string;
++  agentName: string;
++  category: ActionCategory;
++  summary: string;
++  detail?: string;
++  timestamp: number;
++};
++
++export type TaskStatus = "open" | "in_progress" | "blocked" | "done";
++export type TaskPriority = "low" | "medium" | "high" | "critical";
++
++export type TaskItem = {
++  id: string;
++  title: string;
++  description?: string;
++  assignedAgentId: string | null;
++  assignedAgentName: string | null;
++  status: TaskStatus;
++  priority: TaskPriority;
++  createdAt: number;
++  updatedAt: number;
++};
++
++/** CSS class tokens for each action category (border, bg, text). */
++export const ACTION_STYLES: Record<
++  ActionCategory,
++  { border: string; bg: string; text: string; dot: string; label: string }
++> = {
++  chat: {
++    border: "border-sky-400/40",
++    bg: "bg-sky-500/10",
++    text: "text-sky-600 dark:text-sky-400",
++    dot: "bg-sky-500",
++    label: "Chat",
++  },
++  tool_call: {
++    border: "border-violet-400/40",
++    bg: "bg-violet-500/10",
++    text: "text-violet-600 dark:text-violet-400",
++    dot: "bg-violet-500",
++    label: "Tool Call",
++  },
++  config_change: {
++    border: "border-amber-400/40",
++    bg: "bg-amber-500/10",
++    text: "text-amber-600 dark:text-amber-400",
++    dot: "bg-amber-500",
++    label: "Config",
++  },
++  cron_run: {
++    border: "border-emerald-400/40",
++    bg: "bg-emerald-500/10",
++    text: "text-emerald-600 dark:text-emerald-400",
++    dot: "bg-emerald-500",
++    label: "Cron",
++  },
++  heartbeat: {
++    border: "border-teal-400/40",
++    bg: "bg-teal-500/10",
++    text: "text-teal-600 dark:text-teal-400",
++    dot: "bg-teal-500",
++    label: "Heartbeat",
++  },
++  session: {
++    border: "border-indigo-400/40",
++    bg: "bg-indigo-500/10",
++    text: "text-indigo-600 dark:text-indigo-400",
++    dot: "bg-indigo-500",
++    label: "Session",
++  },
++  error: {
++    border: "border-red-400/40",
++    bg: "bg-red-500/10",
++    text: "text-red-600 dark:text-red-400",
++    dot: "bg-red-500",
++    label: "Error",
++  },
++  agent_lifecycle: {
++    border: "border-orange-400/40",
++    bg: "bg-orange-500/10",
++    text: "text-orange-600 dark:text-orange-400",
++    dot: "bg-orange-500",
++    label: "Lifecycle",
++  },
++};
++
++export const TASK_STATUS_STYLES: Record<
++  TaskStatus,
++  { border: string; bg: string; text: string; label: string }
++> = {
++  open: {
++    border: "border-slate-400/40",
++    bg: "bg-slate-500/10",
++    text: "text-slate-600 dark:text-slate-400",
++    label: "Open",
++  },
++  in_progress: {
++    border: "border-blue-400/40",
++    bg: "bg-blue-500/10",
++    text: "text-blue-600 dark:text-blue-400",
++    label: "In Progress",
++  },
++  blocked: {
++    border: "border-red-400/40",
++    bg: "bg-red-500/10",
++    text: "text-red-600 dark:text-red-400",
++    label: "Blocked",
++  },
++  done: {
++    border: "border-emerald-400/40",
++    bg: "bg-emerald-500/10",
++    text: "text-emerald-600 dark:text-emerald-400",
++    label: "Done",
++  },
++};
++
++export const TASK_PRIORITY_STYLES: Record<
++  TaskPriority,
++  { border: string; bg: string; text: string; label: string }
++> = {
++  low: {
++    border: "border-slate-300/40",
++    bg: "bg-slate-400/10",
++    text: "text-slate-500 dark:text-slate-400",
++    label: "Low",
++  },
++  medium: {
++    border: "border-blue-300/40",
++    bg: "bg-blue-400/10",
++    text: "text-blue-500 dark:text-blue-400",
++    label: "Medium",
++  },
++  high: {
++    border: "border-amber-300/40",
++    bg: "bg-amber-400/10",
++    text: "text-amber-600 dark:text-amber-400",
++    label: "High",
++  },
++  critical: {
++    border: "border-red-300/40",
++    bg: "bg-red-400/10",
++    text: "text-red-600 dark:text-red-400",
++    label: "Critical",
++  },
++};
++
++/** Derive actions from agent state snapshots. */
++export const classifyAgentAction = (
++  agentId: string,
++  agentName: string,
++  eventType: string,
++  message?: string
++): ActionEntry => {
++  const now = Date.now();
++  const id = `${agentId}-${now}-${Math.random().toString(36).slice(2, 8)}`;
++
++  let category: ActionCategory = "chat";
++  let summary = message ?? eventType;
++
++  if (eventType === "error" || eventType === "run-error") {
++    category = "error";
++    summary = message ?? "Agent encountered an error";
++  } else if (eventType === "tool-call" || eventType === "tool-result") {
++    category = "tool_call";
++    summary = message ?? "Tool invocation";
++  } else if (eventType === "heartbeat" || eventType === "heartbeat-response") {
++    category = "heartbeat";
++    summary = message ?? "Heartbeat check";
++  } else if (eventType === "cron" || eventType === "cron-run") {
++    category = "cron_run";
++    summary = message ?? "Cron job executed";
++  } else if (
++    eventType === "config-patch" ||
++    eventType === "rename" ||
++    eventType === "settings-change"
++  ) {
++    category = "config_change";
++    summary = message ?? "Configuration updated";
++  } else if (
++    eventType === "session-reset" ||
++    eventType === "session-create" ||
++    eventType === "session-start"
++  ) {
++    category = "session";
++    summary = message ?? "Session lifecycle event";
++  } else if (
++    eventType === "agent-create" ||
++    eventType === "agent-delete" ||
++    eventType === "run-start" ||
++    eventType === "run-end"
++  ) {
++    category = "agent_lifecycle";
++    summary = message ?? "Agent lifecycle event";
++  } else {
++    category = "chat";
++    summary = message ?? "Chat message";
++  }
++
++  return { id, agentId, agentName, category, summary, timestamp: now };
++};
+diff --git a/src/features/dashboard/useActionLog.ts b/src/features/dashboard/useActionLog.ts
+new file mode 100644
+index 0000000..7544a14
+--- /dev/null
++++ b/src/features/dashboard/useActionLog.ts
+@@ -0,0 +1,169 @@
++"use client";
++
++import { useCallback, useEffect, useRef, useState } from "react";
++import type { AgentState } from "@/features/agents/state/store";
++import { type ActionEntry, classifyAgentAction } from "./types";
++
++const MAX_LOG_SIZE = 500;
++
++/**
++ * Derives action entries from agent state transitions.
++ * Watches agent status changes, new output lines, and activity timestamps
++ * to build a running log of colour-coded actions.
++ */
++export const useActionLog = (agents: AgentState[]) => {
++  const [actions, setActions] = useState<ActionEntry[]>([]);
++  const prevSnapshotRef = useRef<Map<string, AgentState>>(new Map());
++
++  const pushAction = useCallback((entry: ActionEntry) => {
++    setActions((prev) => {
++      const next = [entry, ...prev];
++      return next.length > MAX_LOG_SIZE ? next.slice(0, MAX_LOG_SIZE) : next;
++    });
++  }, []);
++
++  useEffect(() => {
++    const prev = prevSnapshotRef.current;
++    const next = new Map(agents.map((a) => [a.agentId, a]));
++
++    for (const agent of agents) {
++      const old = prev.get(agent.agentId);
++
++      // New agent appeared
++      if (!old) {
++        pushAction(
++          classifyAgentAction(
++            agent.agentId,
++            agent.name,
++            "agent-create",
++            `Agent "${agent.name}" appeared in fleet`
++          )
++        );
++        continue;
++      }
++
++      // Status transitions
++      if (old.status !== agent.status) {
++        if (agent.status === "running" && old.status === "idle") {
++          pushAction(
++            classifyAgentAction(
++              agent.agentId,
++              agent.name,
++              "run-start",
++              `Agent started running`
++            )
++          );
++        } else if (agent.status === "idle" && old.status === "running") {
++          pushAction(
++            classifyAgentAction(
++              agent.agentId,
++              agent.name,
++              "run-end",
++              `Agent finished run`
++            )
++          );
++        } else if (agent.status === "error") {
++          pushAction(
++            classifyAgentAction(
++              agent.agentId,
++              agent.name,
++              "error",
++              `Agent entered error state`
++            )
++          );
++        }
++      }
++
++      // New output lines (chat / tool calls)
++      if (agent.outputLines.length > old.outputLines.length) {
++        const newLines = agent.outputLines.slice(old.outputLines.length);
++        for (const line of newLines.slice(-3)) {
++          const trimmed = line.trim();
++          if (!trimmed) continue;
++          const isToolCall =
++            trimmed.startsWith("tool:") ||
++            trimmed.startsWith("Tool call:") ||
++            trimmed.includes("```") ||
++            trimmed.startsWith("[tool");
++          const eventType = isToolCall ? "tool-call" : "chat";
++          pushAction(
++            classifyAgentAction(agent.agentId, agent.name, eventType, trimmed.slice(0, 200))
++          );
++        }
++      }
++
++      // Heartbeat override changed
++      if (agent.latestOverrideKind !== old.latestOverrideKind) {
++        if (agent.latestOverrideKind === "heartbeat") {
++          pushAction(
++            classifyAgentAction(
++              agent.agentId,
++              agent.name,
++              "heartbeat",
++              "Heartbeat check completed"
++            )
++          );
++        } else if (agent.latestOverrideKind === "cron") {
++          pushAction(
++            classifyAgentAction(
++              agent.agentId,
++              agent.name,
++              "cron",
++              "Cron job executed"
++            )
++          );
++        }
++      }
++
++      // Session was reset
++      if (
++        agent.historyLoadedAt !== old.historyLoadedAt &&
++        agent.outputLines.length === 0 &&
++        old.outputLines.length > 0
++      ) {
++        pushAction(
++          classifyAgentAction(
++            agent.agentId,
++            agent.name,
++            "session-reset",
++            "Session was reset"
++          )
++        );
++      }
++
++      // Model/thinking changes
++      if (agent.model !== old.model && old.model !== null) {
++        pushAction(
++          classifyAgentAction(
++            agent.agentId,
++            agent.name,
++            "settings-change",
++            `Model changed to ${agent.model ?? "default"}`
++          )
++        );
++      }
++    }
++
++    // Detect deleted agents
++    for (const [oldId, oldAgent] of prev) {
++      if (!next.has(oldId)) {
++        pushAction(
++          classifyAgentAction(
++            oldId,
++            oldAgent.name,
++            "agent-delete",
++            `Agent "${oldAgent.name}" was removed`
++          )
++        );
++      }
++    }
++
++    prevSnapshotRef.current = next;
++  }, [agents, pushAction]);
++
++  const clearActions = useCallback(() => {
++    setActions([]);
++  }, []);
++
++  return { actions, clearActions };
++};
+-- 
+2.43.0
+
